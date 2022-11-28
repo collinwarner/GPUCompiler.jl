@@ -41,9 +41,14 @@ include("execution.jl")
 include("reflection.jl")
 
 include("precompile.jl")
+include("precompile_native.jl")
 _precompile_()
 
 function __init__()
+    if !is_precompiling()
+        @show MY_CACHE
+        reload_cache()
+    end
     STDERR_HAS_COLOR[] = get(stderr, :color, false)
 
     global compile_cache = @get_scratch!("compiled")
