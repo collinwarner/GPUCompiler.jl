@@ -54,24 +54,40 @@ function reinit_cache(LOCAL_CACHE)
                 global_cache = GPUCompiler.GLOBAL_CI_CACHES[key]
                 local_cache = LOCAL_CACHE[key]
                 for (mi, civ) in (local_cache.dict)
+                    # this should be one since there is only one range that is infinite
+                    @assert length(civ) == 1
                     # add all code instances to global cache
                     # could move truncating code to set index
-                    for ci in civ
-                        Core.Compiler.setindex!(global_cache, ci, mi)
-                    end
-                    # truncation cod3
-                    gciv = global_cache.dict[mi]
-                    # sort by min world age, then make sure no age ranges overlap
-                    sort(gciv, by=x->x.min_world)
-                    if length(gciv) > 1
-                        for (i, ci) in enumerate(gciv[2:end]) # need to figure what iter through
-                            if (ci.min_world <= gciv[i].max_world)
-                                gciv[i].max_world = ci.min_world - 1
+                    ci = civ[1]
+                    println("mi")
+                    @show mi
+                    if haskey(global_cache.dict, mi)
+                        gciv = global_cache.dict[mi]
+                        println("in add to mi zone")
+                        # truncation cod3
+                        # sort by min world age, then make sure no age ranges overlap // this part is uneeded
+                        sort(gciv, by=x->x.min_world)
+                        if ci.min_world > gciv[length(gciv)].min_world
+                            invalidate_code_cache(global_cache, mi, ci.min_world - 1)
+                            Core.Compiler.setindex!(global_cache, ci, mi)
+                        else
+                            println("Should not get here?")
+                            @assert false
+                        end
+                        if length(gciv) > 1
+                            for (i, gci) in enumerate(gciv[2:end]) # need to figure what iter through
+                                if (gci.min_world <= gciv[i].max_world)
+                                    gciv[i].max_world = ci.min_world - 1
+                                end
                             end
                         end
+                        # do I need to invalidate again?
+                        #invalidate_code_cache(global_cache, mi, gciv[end].max_world)
+                    else
+                        println("in set index zone")
+                        @assert false
+                        Core.Compiler.setindex!(global_cache, ci, mi)
                     end
-                    # do I need to invalidate again?
-                    #invalidate_code_cache(global_cache, mi, gciv[end].max_world)
                 end
             else
                 # no conflict at cache level

@@ -54,14 +54,6 @@ Where a function came: package it came from (who entered this thing originally i
 =#
 # could be done here
 function __init__()
-    println("init called")
-    @show MY_CACHE
-    if !is_precompiling()
-        @show MY_CACHE
-        reload_cache()
-    else
-        atexit(snapshot) # might have to do outside the init
-    end
     STDERR_HAS_COLOR[] = get(stderr, :color, false)
 
     global compile_cache = @get_scratch!("compiled")
