@@ -2,7 +2,7 @@ const CACHE_NAME = gensym(:CACHE) # is now a const symbol (not a variable)
 is_precompiling() = ccall(:jl_generating_output, Cint, ()) != 0
 
 struct NativeCompilerParams <: AbstractCompilerParams end
-export @declare_cache, @snapshot_cache, @reinit_cache
+export @declare_cache, @snapshot_cache, @reinit_cache, @get_cache
 
 macro declare_cache()
     var = esc(CACHE_NAME) #this will esc variable from our const symbol
@@ -28,6 +28,13 @@ macro reinit_cache()
     end
 end
 
+macro get_cache()
+    var = esc(CACHE_NAME)
+    quote
+        $var
+    end
+end
+
 """
 Given a function and param types caches the function to the global cache
 """
@@ -42,6 +49,13 @@ function precompile_gpucompiler(job)
     end
 end
 
+function get_code_cache_i(i)
+    for (j, cc) in enumerate(GPUCompiler.GLOBAL_CI_CACHES)
+        if j == i
+            return cc
+        end
+    end
+end
 """
 Reloads Global Cache from global variable which stores the previous
 cached results
@@ -59,11 +73,8 @@ function reinit_cache(LOCAL_CACHE)
                     # add all code instances to global cache
                     # could move truncating code to set index
                     ci = civ[1]
-                    println("mi")
-                    @show mi
                     if haskey(global_cache.dict, mi)
                         gciv = global_cache.dict[mi]
-                        println("in add to mi zone")
                         # truncation cod3
                         # sort by min world age, then make sure no age ranges overlap // this part is uneeded
                         sort(gciv, by=x->x.min_world)
@@ -74,18 +85,8 @@ function reinit_cache(LOCAL_CACHE)
                             println("Should not get here?")
                             @assert false
                         end
-                        if length(gciv) > 1
-                            for (i, gci) in enumerate(gciv[2:end]) # need to figure what iter through
-                                if (gci.min_world <= gciv[i].max_world)
-                                    gciv[i].max_world = ci.min_world - 1
-                                end
-                            end
-                        end
-                        # do I need to invalidate again?
-                        #invalidate_code_cache(global_cache, mi, gciv[end].max_world)
                     else
-                        println("in set index zone")
-                        @assert false
+                        # occurs if we kill everything in the parent and then need to store in child
                         Core.Compiler.setindex!(global_cache, ci, mi)
                     end
                 end
