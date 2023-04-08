@@ -2,40 +2,40 @@
 
 export InvalidIRError
 
-function method_matches(@nospecialize(tt::Type{<:Tuple}); world=Base.get_world_counter())
-    ms = Core.MethodMatch[]
-    for m in Base._methods_by_ftype(tt, -1, world)::Vector
-        m = m::Core.MethodMatch
-        push!(ms, m)
+# TODO: upstream
+function method_matches(@nospecialize(tt::Type{<:Tuple}); world::Integer)
+    methods = Core.MethodMatch[]
+    matches = _methods_by_ftype(tt, -1, world)
+    matches === nothing && return methods
+    for match in matches::Vector
+        push!(methods, match::Core.MethodMatch)
     end
-
-    return ms
+    return methods
 end
 
-function return_type(m::Core.MethodMatch;
-                     interp = Core.Compiler.NativeInterpreter(world))
-    ty = Core.Compiler.typeinf_type(interp, m.method, m.spec_types, m.sparams)
+function typeinf_type(mi::MethodInstance; interp::AbstractInterpreter)
+    ty = Core.Compiler.typeinf_type(interp, mi.def, mi.specTypes, mi.sparam_vals)
     return something(ty, Any)
 end
 
-
 function check_method(@nospecialize(job::CompilerJob))
-    isa(job.source.f, Core.Builtin) && throw(KernelError(job, "function is not a generic function"))
+    ft = job.source.specTypes.parameters[1]
+    ft <: Core.Builtin && error("$(unsafe_function_from_type(ft)) is not a generic function")
 
-    # get the method
-    world = job.source.world
-    ms = method_matches(typed_signature(job); world)
-    isempty(ms)   && throw(KernelError(job, "no method found"))
-    length(ms)!=1 && throw(KernelError(job, "no unique matching method"))
+    for sparam in job.source.sparam_vals
+        if sparam isa TypeVar
+            throw(KernelError(job, "method captures typevar '$sparam' (you probably use an unbound type variable)"))
+        end
+    end
 
     # kernels can't return values
-    if job.source.kernel
+    if job.config.kernel
         cache = ci_cache(job)
         mt = method_table(job)
         ip = inference_params(job)
         op = optimization_params(job)
-        interp = GPUInterpreter(cache, mt, world, ip, op)
-        rt = return_type(only(ms); interp)
+        interp = GPUInterpreter(cache, mt, job.world, ip, op)
+        rt = typeinf_type(job.source; interp)
 
         if rt != Nothing
             throw(KernelError(job, "kernel returns a value of type `$rt`",
@@ -74,10 +74,14 @@ function explain_nonisbits(@nospecialize(dt), depth=1; maxdepth=10)
 end
 
 function check_invocation(@nospecialize(job::CompilerJob))
+    sig = job.source.specTypes
+    ft = sig.parameters[1]
+    tt = Tuple{sig.parameters[2:end]...}
+
+    Base.isdispatchtuple(tt) || error("$tt is not a dispatch tuple")
+
     # make sure any non-isbits arguments are unused
     real_arg_i = 0
-
-    sig = typed_signature(job)
 
     for (arg_i,dt) in enumerate(sig.parameters)
         isghosttype(dt) && continue

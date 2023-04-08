@@ -22,45 +22,41 @@ cread(io) = cread1(io) * cread1(io)
 
     @test only(GPUCompiler.code_lowered(job)) isa Core.CodeInfo
 
-    CI, rt = only(GPUCompiler.code_typed(job))
+    ci, rt = only(GPUCompiler.code_typed(job))
     @test rt === Int
 
-    IR = sprint(io->GPUCompiler.code_warntype(io, job))
-    @test contains(IR, "MethodInstance for identity")
+    ir = sprint(io->GPUCompiler.code_warntype(io, job))
+    @test contains(ir, "MethodInstance for identity")
 
-    IR = sprint(io->GPUCompiler.code_llvm(io, job))
-    @test contains(IR, "julia_identity")
+    ir = sprint(io->GPUCompiler.code_llvm(io, job))
+    @test contains(ir, "julia_identity")
 
-    ASM = sprint(io->GPUCompiler.code_native(io, job))
-    @test contains(ASM, "julia_identity")
+    asm = sprint(io->GPUCompiler.code_native(io, job))
+    @test contains(asm, "julia_identity")
 
     if test_interactive
-        fake_terminal() do term, in, out
-            T = @async begin
-                GPUCompiler.code_typed(job, interactive=true, interruptexc=false, terminal=term)
+        fake_terminal() do term, in, out, err
+            t = @async begin
+                GPUCompiler.code_typed(job, interactive=true, interruptexc=false, terminal=term, annotate_source=false)
             end
             lines = replace(cread(out), r"\e\[[0-9;]*[a-zA-Z]"=>"") # without ANSI escape codes
             @test contains(lines, "identity(x)")
             write(in, 'q')
-            wait(T)
+            wait(t)
         end
     end
 end
 
-
-@testset "Compilation" begin
-    @testset "Callable structs" begin
+@testset "compilation" begin
+    @testset "callable structs" begin
         struct MyCallable end
         (::MyCallable)(a, b) = a+b
 
-        (CI, rt) = native_code_typed(MyCallable(), (Int, Int), kernel=false)[1]
-        @test CI.slottypes[1] == Core.Compiler.Const(MyCallable())
-
-        (CI, rt) = native_code_typed(typeof(MyCallable()), (Int, Int), kernel=false)[1]
-        @test CI.slottypes[1] == Core.Compiler.Const(MyCallable())
+        (ci, rt) = native_code_typed(MyCallable(), (Int, Int), kernel=false)[1]
+        @test ci.slottypes[1] == Core.Compiler.Const(MyCallable())
     end
 
-    @testset "Compilation database" begin
+    @testset "compilation database" begin
         @noinline inner(x) = x+1
         function outer(x)
             return inner(x)
@@ -81,7 +77,7 @@ end
         end
     end
 
-    @testset "Advanced database" begin
+    @testset "advanced database" begin
         @noinline inner(x) = x+1
         foo(x) = sum(inner, fill(x, 10, 10))
 
@@ -100,6 +96,87 @@ end
             end
             @test length(inner_methods) == 1
         end
+    end
+
+    @testset "cached compilation" begin
+        @gensym child kernel
+        @eval @noinline $child(i) = sink(i)
+        @eval $kernel(i) = $child(i)+1
+
+        # smoke test
+        job, _ = native_job(eval(kernel), (Int64,))
+        ir = sprint(io->GPUCompiler.code_llvm(io, job))
+        @test contains(ir, "add i64 %1, 1")
+
+        # basic redefinition
+        @eval $kernel(i) = $child(i)+2
+        job, _ = native_job(eval(kernel), (Int64,))
+        ir = sprint(io->GPUCompiler.code_llvm(io, job))
+        @test contains(ir, "add i64 %1, 2")
+
+        # cached_compilation interface
+        invocations = Ref(0)
+        function compiler(job)
+            invocations[] += 1
+            ir = sprint(io->GPUCompiler.code_llvm(io, job))
+            return ir
+        end
+        linker(job, compiled) = compiled
+        cache = Dict{UInt,Any}()
+        ft = typeof(eval(kernel))
+        tt = Tuple{Int64}
+
+        # initial compilation
+        ir = GPUCompiler.cached_compilation(cache, job.config, ft, tt, compiler, linker)
+        @test contains(ir, "add i64 %1, 2")
+        @test invocations[] == 1
+        @test length(cache) == 1
+
+        # cached compilation
+        ir = GPUCompiler.cached_compilation(cache, job.config, ft, tt, compiler, linker)
+        @test contains(ir, "add i64 %1, 2")
+        @test invocations[] == 1
+        @test length(cache) == 1
+
+        # redefinition
+        @eval $kernel(i) = $child(i)+3
+        ir = GPUCompiler.cached_compilation(cache, job.config, ft, tt, compiler, linker)
+        @test contains(ir, "add i64 %1, 3")
+        @test invocations[] == 2
+        @test length(cache) == 2
+
+        # cached compilation
+        ir = GPUCompiler.cached_compilation(cache, job.config, ft, tt, compiler, linker)
+        @test contains(ir, "add i64 %1, 3")
+        @test invocations[] == 2
+        @test length(cache) == 2
+
+        # redefining child functions
+        @eval @noinline $child(i) = sink(i)+1
+        ir = GPUCompiler.cached_compilation(cache, job.config, ft, tt, compiler, linker)
+        @test invocations[] == 3
+        @test length(cache) == 3
+
+        # cached compilation
+        ir = GPUCompiler.cached_compilation(cache, job.config, ft, tt, compiler, linker)
+        @test invocations[] == 3
+        @test length(cache) == 3
+
+        # tasks running in the background should keep on using the old version
+        c1, c2 = Condition(), Condition()
+        function background(job)
+            notify(c1)
+            wait(c2)    # wait for redefinition
+            GPUCompiler.cached_compilation(cache, job.config, ft, tt, compiler, linker)
+        end
+        t = @async background(job)
+        wait(c1)        # make sure the task has started
+        @eval $kernel(i) = $child(i)+4
+        ir = GPUCompiler.cached_compilation(cache, job.config, ft, tt, compiler, linker)
+        @test contains(ir, "add i64 %1, 4")
+        notify(c2)      # wake up the task
+        ir = fetch(t)
+        @test contains(ir, "add i64 %1, 3")
     end
 end
 
@@ -135,7 +212,7 @@ end
     parent(i) = child(i)
 
     ir = sprint(io->native_code_llvm(io, parent, Tuple{Int}))
-    @test occursin(r"call .+ @julia_child_", ir)
+    @test occursin(r"call .+ @julia.+child.+", ir)
 end
 
 @testset "sysimg" begin
@@ -290,25 +367,6 @@ end
         occursin("BigInt", msg)
     end
 
-    # test that we can handle abstract types
-    @test_throws_message(KernelError,
-                         native_code_execution(foobar, Tuple{Any})) do msg
-        occursin("passing and using non-bitstype argument", msg) &&
-        occursin("Any", msg)
-    end
-
-    @test_throws_message(KernelError,
-                         native_code_execution(foobar, Tuple{Union{Int32, Int64}})) do msg
-        occursin("passing and using non-bitstype argument", msg) &&
-        occursin("Union{Int32, Int64}", msg)
-    end
-
-    @test_throws_message(KernelError,
-                         native_code_execution(foobar, Tuple{Union{Int32, Int64}})) do msg
-        occursin("passing and using non-bitstype argument", msg) &&
-        occursin("Union{Int32, Int64}", msg)
-    end
-
     # test that we get information about fields and reason why something is not isbits
     @test_throws_message(KernelError,
                          native_code_execution(foobar, Tuple{CleverType{BigInt}})) do msg
@@ -422,6 +480,7 @@ end
     @test call_real(1.0+im) == 1.0
 
     # Test ABI removal
+    # XXX: this relies on llvm_always_inline, which it shouldn't
     ir = sprint(io->native_code_llvm(io, call_real, Tuple{ComplexF64}))
     @test !occursin("alloca", ir)
 
@@ -469,7 +528,12 @@ end
 
     mod = @eval module $(gensym())
         using ..GPUCompiler
-        import ..method_table
+
+        @static if isdefined(Base.Experimental, Symbol("@overlay"))
+        Base.Experimental.@MethodTable(method_table)
+        else
+        const method_table = nothing
+        end
 
         kernel() = child()
         child() = 0
@@ -477,14 +541,14 @@ end
         GPUCompiler.@override method_table child() = 1
     end
 
-    ir = sprint(io->native_code_llvm(io, mod.kernel, Tuple{}))
+    ir = sprint(io->native_code_llvm(io, mod.kernel, Tuple{}; mod.method_table))
     @test occursin("ret i64 1", ir)
 end
 
+if VERSION >= v"1.7"
 @testset "#366: semi-concrete interpretation + overlay methods = dynamic dispatch" begin
     mod = @eval module $(gensym())
         using ..GPUCompiler
-        import ..method_table
         using StaticArrays
 
         function kernel(width, height)
@@ -494,13 +558,38 @@ end
             return
         end
 
+        Base.Experimental.@MethodTable method_table
         GPUCompiler.@override method_table Base.isnan(x::Float32) =
             (ccall("extern __nv_isnanf", llvmcall, Int32, (Cfloat,), x)) != 0
     end
 
-    ir = sprint(io->native_code_llvm(io, mod.kernel, Tuple{Int, Int}; debuginfo=:none))
+    ir = sprint(io->native_code_llvm(io, mod.kernel, Tuple{Int, Int};
+                                     debuginfo=:none, mod.method_table))
     @test !occursin("apply_generic", ir)
     @test occursin("llvm.floor", ir)
+end
+
+@testset "JuliaLang/julia#48097: kwcall inference in the presence of overlay method" begin
+    mod = @eval module $(gensym())
+        using ..GPUCompiler
+        child(; kwargs...) = return
+        function parent()
+            child(; a=1f0, b=1.0)
+            return
+        end
+
+        Base.Experimental.@MethodTable method_table
+        Base.Experimental.@overlay method_table @noinline Core.throw_inexacterror(f::Symbol, ::Type{T}, val) where {T} =
+        return
+    end
+
+    ir = sprint(io->native_code_llvm(io, mod.parent, Tuple{};
+                                     debuginfo=:none, mod.method_table))
+    @test !occursin("jl_invoke", ir)
+    @test !occursin("apply_iterate", ir)
+    @test !occursin("inttoptr", ir)
+    @test occursin("ret void", ir)
+end
 end
 
 ############################################################################################

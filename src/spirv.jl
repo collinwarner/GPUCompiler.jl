@@ -42,7 +42,7 @@ end
 function process_entry!(job::CompilerJob{SPIRVCompilerTarget}, mod::LLVM.Module, entry::LLVM.Function)
     entry = invoke(process_entry!, Tuple{CompilerJob, LLVM.Module, LLVM.Function}, job, mod, entry)
 
-    if job.source.kernel
+    if job.config.kernel
         # calling convention
         callconv!(entry, LLVM.API.LLVMSPIRKERNELCallConv)
     end
@@ -54,7 +54,7 @@ function finish_module!(job::CompilerJob{SPIRVCompilerTarget}, mod::LLVM.Module,
     ctx = context(mod)
     entry = invoke(finish_module!, Tuple{CompilerJob, LLVM.Module, LLVM.Function}, job, mod, entry)
 
-    if job.source.kernel
+    if job.config.kernel
         # HACK: Intel's compute runtime doesn't properly support SPIR-V's byval attribute.
         #       they do support struct byval, for OpenCL, so wrap byval parameters in a struct.
         entry = wrap_byval(job, mod, entry)
@@ -147,7 +147,7 @@ end
 
 # reimplementation that uses `spirv-dis`, giving much more pleasant output
 function code_native(io::IO, job::CompilerJob{SPIRVCompilerTarget}; raw::Bool=false, dump_module::Bool=false)
-    obj, _ = codegen(:obj, job; strip=!raw, only_entry=!dump_module, validate=false)
+    obj, _ = compile(:obj, job; strip=!raw, only_entry=!dump_module, validate=false)
     mktemp() do input_path, input_io
         write(input_io, obj)
         flush(input_io)
@@ -218,8 +218,8 @@ end
 # wrap byval pointers in a single-value struct
 function wrap_byval(@nospecialize(job::CompilerJob), mod::LLVM.Module, f::LLVM.Function)
     ctx = context(mod)
-    ft = eltype(llvmtype(f)::LLVM.PointerType)::LLVM.FunctionType
-    @compiler_assert LLVM.return_type(ft) == LLVM.VoidType(ctx) job
+    ft = function_type(f)::LLVM.FunctionType
+    @compiler_assert return_type(ft) == LLVM.VoidType(ctx) job
 
     # find the byval parameters
     byval = BitVector(undef, length(parameters(ft)))
@@ -261,14 +261,14 @@ function wrap_byval(@nospecialize(job::CompilerJob), mod::LLVM.Module, f::LLVM.F
 
     # emit IR performing the "conversions"
     new_args = Vector{LLVM.Value}()
-    @dispose builder=Builder(ctx) begin
+    @dispose builder=IRBuilder(ctx) begin
         entry = BasicBlock(new_f, "conversion"; ctx)
         position!(builder, entry)
 
         # perform argument conversions
         for (i, param) in enumerate(parameters(new_f))
             if byval[i]
-                ptr = struct_gep!(builder, param, 0)
+                ptr = struct_gep!(builder, eltype(parameters(new_ft)[i]), param, 0)
                 push!(new_args, ptr)
             else
                 push!(new_args, param)

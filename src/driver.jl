@@ -1,6 +1,53 @@
 # compiler driver and main interface
 
+
+## LLVM context handling
+
 export JuliaContext
+
+# transitionary feature to deal versions of Julia that rely on a global context
+#
+# Julia 1.9 removed the global LLVM context, requiring to pass a context to codegen APIs,
+# so the GPUCompiler APIs have been adapted to require passing a Context object as well.
+# however, on older versions of Julia we cannot make codegen emit into that context. we
+# could use a hack (serialize + deserialize) to move code into the correct context, however
+# as it turns out some of our optimization passes erroneously rely on the context being
+# global and unique, resulting in segfaults when we use a local context instead.
+#
+# to work around this mess, and still present a reasonably unified API, we introduce the
+# JuliaContext helper below, which returns a local context on Julia 1.9, and the global
+# unique context on all other versions. Once we only support Julia 1.9, we'll deprecate
+# this helper to a regular `Context()` call.
+function JuliaContext()
+    if VERSION >= v"1.9.0-DEV.115"
+        # Julia 1.9 knows how to deal with arbitrary contexts
+        JuliaContextType()
+    else
+        # earlier versions of Julia claim so, but actually use a global context
+        isboxed_ref = Ref{Bool}()
+        typ = LLVMType(ccall(:jl_type_to_llvm, LLVM.API.LLVMTypeRef,
+                       (Any, Ptr{Bool}), Any, isboxed_ref))
+        context(typ)
+    end
+end
+function JuliaContext(f)
+    if VERSION >= v"1.9.0-DEV.115"
+        JuliaContextType(f)
+    else
+        f(JuliaContext())
+        # we cannot dispose of the global unique context
+    end
+end
+
+if VERSION >= v"1.9.0-DEV.516"
+unwrap_context(ctx::ThreadSafeContext) = context(ctx)
+end
+unwrap_context(ctx::Context) = ctx
+
+
+## compiler entrypoint
+
+export compile
 
 # NOTE: the keyword arguments to compile/codegen control those aspects of compilation that
 #       might have to be changed (e.g. set libraries=false when recursing, or set
@@ -44,56 +91,14 @@ function compile(target::Symbol, @nospecialize(job::CompilerJob);
                    libraries, deferred_codegen, optimize, cleanup, strip, validate, only_entry, ctx)
 end
 
-# transitionary feature to deal versions of Julia that rely on a global context
-#
-# Julia 1.9 removed the global LLVM context, requiring to pass a context to codegen APIs,
-# so the GPUCompiler APIs have been adapted to require passing a Context object as well.
-# however, on older versions of Julia we cannot make codegen emit into that context. we
-# could use a hack (serialize + deserialize) to move code into the correct context, however
-# as it turns out some of our optimization passes erroneously rely on the context being
-# global and unique, resulting in segfaults when we use a local context instead.
-#
-# to work around this mess, and still present a reasonably unified API, we introduce the
-# JuliaContext helper below, which returns a local context on Julia 1.9, and the global
-# unique context on all other versions. Once we only support Julia 1.9, we'll deprecate
-# this helper to a regular `Context()` call.
-function JuliaContext()
-    if VERSION >= v"1.9.0-DEV.115"
-        # Julia 1.9 knows how to deal with arbitrary contexts
-        JuliaContextType()
-    else
-        # earlier versions of Julia claim so, but actually use a global context
-        isboxed_ref = Ref{Bool}()
-        typ = LLVMType(ccall(:jl_type_to_llvm, LLVM.API.LLVMTypeRef,
-                       (Any, Ptr{Bool}), Any, isboxed_ref))
-        context(typ)
-    end
-end
-function JuliaContext(f)
-    if VERSION >= v"1.9.0-DEV.115"
-        JuliaContextType(f)
-    else
-        f(JuliaContext())
-        # we cannot dispose of the global unique context
-    end
-end
-
-if VERSION >= v"1.9.0-DEV.516"
-unwrap_context(ctx::ThreadSafeContext) = context(ctx)
-end
-unwrap_context(ctx::Context) = ctx
-
 function codegen(output::Symbol, @nospecialize(job::CompilerJob);
                  libraries::Bool=true, deferred_codegen::Bool=true, optimize::Bool=true,
                  cleanup::Bool=true, strip::Bool=false, validate::Bool=true,
                  only_entry::Bool=false, parent_job::Union{Nothing, CompilerJob}=nothing,
                  ctx::Union{JuliaContextType,Nothing}=nothing)
-    ## Julia IR
-
-    mi, mi_meta = emit_julia(job; validate)
-
-    if output == :julia
-        return mi, mi_meta
+    @timeit_debug to "Validation" begin
+        check_method(job)   # not optional
+        validate && check_invocation(job)
     end
 
     temporary_context = ctx === nothing
@@ -112,7 +117,7 @@ function codegen(output::Symbol, @nospecialize(job::CompilerJob);
                      Use a JuliaContext instead.""")
         end
 
-        ir, ir_meta = emit_llvm(job, mi; libraries, deferred_codegen, optimize, cleanup, only_entry, validate, ctx)
+        ir, ir_meta = emit_llvm(job; libraries, deferred_codegen, optimize, cleanup, only_entry, validate, ctx)
 
         if output == :llvm
             if strip
@@ -135,7 +140,7 @@ function codegen(output::Symbol, @nospecialize(job::CompilerJob);
         asm, asm_meta = emit_asm(job, ir; strip, validate, format)
 
         if output == :asm || output == :obj
-            return asm, asm_meta
+            return asm, (; asm_meta..., ir_meta..., ir)
         end
 
 
@@ -148,40 +153,10 @@ function codegen(output::Symbol, @nospecialize(job::CompilerJob);
     end
 end
 
-@locked function emit_julia(@nospecialize(job::CompilerJob); validate::Bool=true)
-    @timeit_debug to "Validation" begin
-        check_method(job)   # not optional
-        validate && check_invocation(job)
-    end
-
-    @timeit_debug to "Julia front-end" begin
-
-        # get the method instance
-        sig = typed_signature(job)
-        meth = which(sig)
-
-        (ti, env) = ccall(:jl_type_intersection_with_env, Any,
-                          (Any, Any), sig, meth.sig)::Core.SimpleVector
-
-        meth = Base.func_for_method_checked(meth, ti, env)
-
-        method_instance = ccall(:jl_specializations_get_linfo, Ref{Core.MethodInstance},
-                      (Any, Any, Any, UInt), meth, ti, env, job.source.world)
-
-        for var in env
-            if var isa TypeVar
-                throw(KernelError(job, "method captures a typevar (you probably use an unbound type variable)"))
-            end
-        end
-    end
-
-    return method_instance, ()
-end
-
 # primitive mechanism for deferred compilation, for implementing CUDA dynamic parallelism.
 # this could both be generalized (e.g. supporting actual function calls, instead of
 # returning a function pointer), and be integrated with the nonrecursive codegen.
-const deferred_codegen_jobs = Dict{Int, Union{FunctionSpec, CompilerJob}}()
+const deferred_codegen_jobs = Dict{Int, Any}()
 
 # We make this function explicitly callable so that we can drive OrcJIT's
 # lazy compilation from, while also enabling recursive compilation.
@@ -189,9 +164,15 @@ Base.@ccallable Ptr{Cvoid} function deferred_codegen(ptr::Ptr{Cvoid})
     ptr
 end
 
-@generated function deferred_codegen(::Val{f}, ::Val{tt}) where {f,tt}
+@generated function deferred_codegen(::Val{ft}, ::Val{tt}) where {ft,tt}
     id = length(deferred_codegen_jobs) + 1
-    deferred_codegen_jobs[id] = FunctionSpec(f,tt)
+    deferred_codegen_jobs[id] = (; ft, tt)
+    # don't bother looking up the method instance, as we'll do so again during codegen
+    # using the world age of the parent.
+    #
+    # this also works around an issue on <1.10, where we don't know the world age of
+    # generated functions so use the current world counter, which may be too new
+    # for the world we're compiling for.
 
     pseudo_ptr = reinterpret(Ptr{Cvoid}, id)
     quote
@@ -202,7 +183,7 @@ end
 
 const __llvm_initialized = Ref(false)
 
-@locked function emit_llvm(@nospecialize(job::CompilerJob), @nospecialize(method_instance);
+@locked function emit_llvm(@nospecialize(job::CompilerJob);
                            libraries::Bool=true, deferred_codegen::Bool=true, optimize::Bool=true,
                            cleanup::Bool=true, only_entry::Bool=false, validate::Bool=true,
                            ctx::JuliaContextType)
@@ -216,11 +197,11 @@ const __llvm_initialized = Ref(false)
     end
 
     @timeit_debug to "IR generation" begin
-        ir, compiled = irgen(job, method_instance; ctx)
-        if job.entry_abi === :specfunc
-            entry_fn = compiled[method_instance].specfunc
+        ir, compiled = irgen(job; ctx)
+        if job.config.entry_abi === :specfunc
+            entry_fn = compiled[job.source].specfunc
         else
-            entry_fn = compiled[method_instance].func
+            entry_fn = compiled[job.source].func
         end
         entry = functions(ir)[entry_fn]
     end
@@ -286,10 +267,18 @@ const __llvm_initialized = Ref(false)
                 id = convert(Int, first(operands(call)))
 
                 global deferred_codegen_jobs
-                dyn_job = deferred_codegen_jobs[id]
-                if dyn_job isa FunctionSpec
-                    dyn_job = similar(job, dyn_job)
+                dyn_val = deferred_codegen_jobs[id]
+
+                # get a job in the appopriate world
+                dyn_job = if dyn_val isa CompilerJob
+                    # trust that the user knows what they're doing
+                    dyn_val
+                else
+                    ft, tt = dyn_val
+                    dyn_src = methodinstance(ft, tt, tls_world_age())
+                    CompilerJob(dyn_src, job.config)
                 end
+
                 push!(get!(worklist, dyn_job, LLVM.CallInst[]), call)
             end
 
@@ -313,7 +302,7 @@ const __llvm_initialized = Ref(false)
                 # insert a pointer to the function everywhere the entry is used
                 T_ptr = convert(LLVMType, Ptr{Cvoid}; ctx=unwrap_context(ctx))
                 for call in worklist[dyn_job]
-                    @dispose builder=Builder(unwrap_context(ctx)) begin
+                    @dispose builder=IRBuilder(unwrap_context(ctx)) begin
                         position!(builder, call)
                         fptr = ptrtoint!(builder, dyn_entry, T_ptr)
                         replace_uses!(call, fptr)
@@ -330,7 +319,7 @@ const __llvm_initialized = Ref(false)
 
     @timeit_debug to "IR post-processing" begin
         # mark the kernel entry-point functions (optimization may need it)
-        if job.source.kernel
+        if job.config.kernel
             push!(metadata(ir)["julia.kernel"], MDNode([entry]; ctx=unwrap_context(ctx)))
 
             # IDEA: save all jobs, not only kernels, and save other attributes

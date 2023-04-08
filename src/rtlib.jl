@@ -15,16 +15,6 @@ end
 # GPU run-time library
 #
 
-# get the path to a directory where we can put cache files (machine-specific, ephemeral)
-# NOTE: maybe we should use XDG_CACHE_PATH/%LOCALAPPDATA%, but other Julia cache files
-#       are put in .julia anyway so let's just follow suit for now.
-function cachedir(depot=DEPOT_PATH[1])
-    # this mimicks Base.compilecache. we can't just call the function, or we might actually
-    # _generate_ a cache file, e.g., when running with `--compiled-modules=no`.
-    entrypath, entryfile = Base.cache_file_entry(Base.PkgId(GPUCompiler))
-    abspath(depot, entrypath, entryfile)
-end
-
 
 ## higher-level functionality to work with runtime functions
 
@@ -37,7 +27,7 @@ function LLVM.call!(builder, rt::Runtime.RuntimeMethodInstance, args=LLVM.Value[
     # get or create a function prototype
     if haskey(functions(mod), rt.llvm_name)
         f = functions(mod)[rt.llvm_name]
-        ft = eltype(llvmtype(f))
+        ft = function_type(f)
     else
         ft = convert(LLVM.FunctionType, rt; ctx)
         f = LLVM.Function(mod, rt.llvm_name, ft)
@@ -46,8 +36,8 @@ function LLVM.call!(builder, rt::Runtime.RuntimeMethodInstance, args=LLVM.Value[
     # runtime functions are written in Julia, while we're calling from LLVM,
     # this often results in argument type mismatches. try to fix some here.
     for (i,arg) in enumerate(args)
-        if llvmtype(arg) != parameters(ft)[i]
-            if (llvmtype(arg) isa LLVM.PointerType) &&
+        if value_type(arg) != parameters(ft)[i]
+            if (value_type(arg) isa LLVM.PointerType) &&
                (parameters(ft)[i] isa LLVM.IntegerType)
                 # Julia pointers are passed as integers
                 args[i] = ptrtoint!(builder, args[i], parameters(ft)[i])
@@ -57,20 +47,21 @@ function LLVM.call!(builder, rt::Runtime.RuntimeMethodInstance, args=LLVM.Value[
         end
     end
 
-    call!(builder, f, args)
+    call!(builder, ft, f, args)
 end
 
 
 ## functionality to build the runtime library
 
-function emit_function!(mod, @nospecialize(job::CompilerJob), f, method; ctx::JuliaContextType)
+function emit_function!(mod, config::CompilerConfig, f, method; ctx::JuliaContextType)
     tt = Base.to_tuple_type(method.types)
-    new_mod, meta = codegen(:llvm, similar(job, FunctionSpec(f, tt, #=kernel=# false));
+    source = methodinstance(f, tt)
+    new_mod, meta = codegen(:llvm, CompilerJob(source, config);
                             optimize=false, libraries=false, validate=false, ctx)
-    ft = eltype(llvmtype(meta.entry))
+    ft = function_type(meta.entry)
     expected_ft = convert(LLVM.FunctionType, method; ctx=context(new_mod))
-    if LLVM.return_type(ft) != LLVM.return_type(expected_ft)
-        error("Invalid return type for runtime function '$(method.name)': expected $(LLVM.return_type(expected_ft)), got $(LLVM.return_type(ft))")
+    if return_type(ft) != return_type(expected_ft)
+        error("Invalid return type for runtime function '$(method.name)': expected $(return_type(expected_ft)), got $(return_type(ft))")
     end
 
     # recent Julia versions include prototypes for all runtime functions, even if unused
@@ -88,7 +79,7 @@ function emit_function!(mod, @nospecialize(job::CompilerJob), f, method; ctx::Ju
     name = method.llvm_name
     if haskey(functions(mod), name)
         decl = functions(mod)[name]
-        @assert llvmtype(decl) == llvmtype(entry)
+        @assert value_type(decl) == value_type(entry)
         replace_uses!(decl, entry)
         unsafe_delete!(mod, decl)
     end
@@ -100,8 +91,7 @@ function build_runtime(@nospecialize(job::CompilerJob); ctx)
 
     # the compiler job passed into here is identifies the job that requires the runtime.
     # derive a job that represents the runtime itself (notably with kernel=false).
-    source = FunctionSpec(typeof(identity), Tuple{Nothing}, false, nothing, job.source.world_age)
-    job = CompilerJob(job.target, source, job.params)
+    config = CompilerConfig(job.config; kernel=false)
 
     for method in values(Runtime.methods)
         def = if isa(method.def, Symbol)
@@ -110,7 +100,7 @@ function build_runtime(@nospecialize(job::CompilerJob); ctx)
         else
             method.def
         end
-        emit_function!(mod, job, typeof(def), method; ctx)
+        emit_function!(mod, config, typeof(def), method; ctx)
     end
 
     # we cannot optimize the runtime library, because the code would then be optimized again
@@ -125,30 +115,9 @@ const runtime_lock = ReentrantLock()
 
 @locked function load_runtime(@nospecialize(job::CompilerJob); ctx)
     lock(runtime_lock) do
-        # find the first existing cache directory (for when dealing with layered depots)
-        cachedirs = [cachedir(depot) for depot in DEPOT_PATH]
-        filter!(isdir, cachedirs)
-        input_dir = if isempty(cachedirs)
-            nothing
-        else
-            first(cachedirs)
-        end
-
-        # we are only guaranteed to be able to write in the current depot
-        output_dir = cachedir()
-
-        # if both aren't equal, copy pregenerated runtime libraries to our depot
-        # NOTE: we don't just lazily read from the one and write to the other, because
-        #       once we generate additional runtimes in the output dir we don't know if
-        #       it's safe to load from other layers (since those could have been invalidated)
-        if input_dir !== nothing && input_dir != output_dir
-            mkpath(dirname(output_dir))
-            cp(input_dir, output_dir)
-        end
-
         slug = runtime_slug(job)
         name = "runtime_$(slug).bc"
-        path = joinpath(output_dir, name)
+        path = joinpath(compile_cache, name)
 
         lib = try
             if ispath(path)
@@ -163,7 +132,7 @@ const runtime_lock = ReentrantLock()
 
         if lib === nothing
             @debug "Building the GPU runtime library at $path"
-            mkpath(output_dir)
+            mkpath(compile_cache)
             lib = build_runtime(job; ctx)
 
             # atomic write to disk
@@ -181,10 +150,7 @@ end
 # NOTE: call this function from global scope, so any change triggers recompilation.
 function reset_runtime()
     lock(runtime_lock) do
-        rm(cachedir(); recursive=true, force=true)
-        # create an empty cache directory. since we only ever load from the first existing cachedir,
-        # this effectively invalidates preexisting caches in lower layers of the depot.
-        mkpath(cachedir())
+        rm(compile_cache; recursive=true, force=true)
     end
 
     return

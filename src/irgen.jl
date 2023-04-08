@@ -1,18 +1,17 @@
 # LLVM IR generation
 
-function irgen(@nospecialize(job::CompilerJob), method_instance::Core.MethodInstance;
-               ctx::JuliaContextType)
-    mod, compiled = @timeit_debug to "emission" compile_method_instance(job, method_instance; ctx)
-    if job.entry_abi === :specfunc
-        entry_fn = compiled[method_instance].specfunc
+function irgen(@nospecialize(job::CompilerJob); ctx::JuliaContextType)
+    mod, compiled = @timeit_debug to "emission" compile_method_instance(job; ctx)
+    if job.config.entry_abi === :specfunc
+        entry_fn = compiled[job.source].specfunc
     else
-        entry_fn = compiled[method_instance].func
+        entry_fn = compiled[job.source].func
     end
 
     # clean up incompatibilities
     @timeit_debug to "clean-up" begin
         for llvmf in functions(mod)
-            if VERSION < v"1.9.0-DEV.516"
+            if VERSION < v"1.9" || Base.isdebugbuild()
                 # only occurs in debug builds
                 delete!(function_attributes(llvmf),
                         EnumAttribute("sspstrong", 0; ctx=unwrap_context(ctx)))
@@ -24,7 +23,7 @@ function irgen(@nospecialize(job::CompilerJob), method_instance::Core.MethodInst
 
             # remove the non-specialized jfptr functions
             # TODO: Do we need to remove these?
-            if job.entry_abi === :specfunc
+            if job.config.entry_abi === :specfunc
                 if startswith(LLVM.name(llvmf), "jfptr_")
                     unsafe_delete!(mod, llvmf)
                 end
@@ -60,23 +59,22 @@ function irgen(@nospecialize(job::CompilerJob), method_instance::Core.MethodInst
     end
 
     # rename and process the entry point
-    if job.source.name !== nothing
-        LLVM.name!(entry, safe_name(string("julia_", job.source.name)))
-    end
-    if job.source.kernel
-        LLVM.name!(entry, mangle_call(entry, job.source.tt))
+    if job.config.name !== nothing
+        LLVM.name!(entry, safe_name(job.config.name))
+    elseif job.config.kernel
+        LLVM.name!(entry, mangle_sig(job.source.specTypes))
     end
     entry = process_entry!(job, mod, entry)
-    if job.entry_abi === :specfunc
-        func = compiled[method_instance].func
+    if job.config.entry_abi === :specfunc
+        func = compiled[job.source].func
         specfunc = LLVM.name(entry)
     else
         func = LLVM.name(entry)
-        specfunc = compiled[method_instance].specfunc
+        specfunc = compiled[job.source].specfunc
     end
 
-    compiled[method_instance] =
-        (; compiled[method_instance].ci, func, specfunc)
+    compiled[job.source] =
+        (; compiled[job.source].ci, func, specfunc)
 
     # minimal required optimization
     @timeit_debug to "rewrite" @dispose pm=ModulePassManager() begin
@@ -111,13 +109,13 @@ end
 # we generate function names that look like C++ functions, because many NVIDIA tools
 # support them, e.g., grouping different instantiations of the same kernel together.
 
-function mangle_param(t, substitutions)
+function mangle_param(t, substitutions=String[])
     t == Nothing && return "v"
 
     if isa(t, DataType) && t <: Ptr
         tn = mangle_param(eltype(t), substitutions)
         "P$tn"
-    elseif isa(t, DataType) || isa(t, Core.Function)
+    elseif isa(t, DataType)
         tn = safe_name(t)
 
         # handle substitutions
@@ -141,6 +139,30 @@ function mangle_param(t, substitutions)
         end
 
         str
+    elseif isa(t, Union)
+        tn = "Union"
+
+        # handle substitutions
+        sub = findfirst(isequal(tn), substitutions)
+        if sub === nothing
+            str = "$(length(tn))$tn"
+            push!(substitutions, tn)
+        elseif sub == 1
+            str = "S_"
+        else
+            str = "S$(sub-2)_"
+        end
+
+        # encode union types as template parameters
+        if !isempty(Base.uniontypes(t))
+            str *= "I"
+            for t in Base.uniontypes(t)
+                str *= mangle_param(t, substitutions)
+            end
+            str *= "E"
+        end
+
+        str
     elseif isa(t, Integer)
         t > 0 ? "Li$(t)E" : "Lin$(abs(t))E"
     else
@@ -153,12 +175,16 @@ function mangle_param(t, substitutions)
     end
 end
 
-function mangle_call(f, tt)
-    fn = safe_name(f)
+function mangle_sig(sig)
+    ft, tt... = sig.parameters
+
+    # mangle the function name
+    fn = safe_name(ft)
     str = "_Z$(length(fn))$fn"
 
+    # mangle each parameter
     substitutions = String[]
-    for t in tt.parameters
+    for t in tt
         str *= mangle_param(t, substitutions)
     end
 
@@ -166,9 +192,19 @@ function mangle_call(f, tt)
 end
 
 # make names safe for ptxas
-safe_name(fn::String) = replace(fn, r"[^A-Za-z0-9_]"=>"_")
-safe_name(f::Union{Core.Function,DataType}) = safe_name(String(nameof(f)))
-safe_name(f::LLVM.Function) = safe_name(LLVM.name(f))
+safe_name(fn::String) = replace(fn, r"[^A-Za-z0-9]"=>"_")
+safe_name(t::DataType) = safe_name(String(nameof(t)))
+function safe_name(t::Type{<:Function})
+    # like Base.nameof, but for function types
+    mt = t.name.mt
+    fn = if mt === Symbol.name.mt
+        # uses shared method table, so name is not unique to this function type
+        nameof(t)
+    else
+        mt.name
+    end
+    safe_name(string(fn))
+end
 safe_name(x) = safe_name(repr(x))
 
 
@@ -214,7 +250,7 @@ function lower_throw!(mod::LLVM.Module)
                 call = user(use)::LLVM.CallInst
 
                 # replace the throw with a PTX-compatible exception
-                @dispose builder=Builder(ctx) begin
+                @dispose builder=IRBuilder(ctx) begin
                     position!(builder, call)
                     emit_exception!(builder, name, call)
                 end
@@ -294,12 +330,13 @@ end
 
 function emit_trap!(@nospecialize(job::CompilerJob), builder, mod, inst)
     ctx = context(mod)
+    trap_ft = LLVM.FunctionType(LLVM.VoidType(ctx))
     trap = if haskey(functions(mod), "llvm.trap")
         functions(mod)["llvm.trap"]
     else
-        LLVM.Function(mod, "llvm.trap", LLVM.FunctionType(LLVM.VoidType(ctx)))
+        LLVM.Function(mod, "llvm.trap", trap_ft)
     end
-    call!(builder, trap)
+    call!(builder, trap_ft, trap)
 end
 
 
@@ -313,7 +350,7 @@ end
 end
 
 function classify_arguments(@nospecialize(job::CompilerJob), codegen_ft::LLVM.FunctionType)
-    source_sig = typed_signature(job)
+    source_sig = job.source.specTypes
 
     source_types = [source_sig.parameters...]
 
@@ -399,8 +436,8 @@ end
 # https://reviews.llvm.org/D79744
 function lower_byval(@nospecialize(job::CompilerJob), mod::LLVM.Module, f::LLVM.Function)
     ctx = context(mod)
-    ft = eltype(llvmtype(f))
-    @compiler_assert LLVM.return_type(ft) == LLVM.VoidType(ctx) job
+    ft = function_type(f)
+    @compiler_assert return_type(ft) == LLVM.VoidType(ctx) job
     @timeit_debug to "lower byval" begin
 
     # find the byval parameters
@@ -464,7 +501,7 @@ function lower_byval(@nospecialize(job::CompilerJob), mod::LLVM.Module, f::LLVM.
             push!(new_types, param)
         end
     end
-    new_ft = LLVM.FunctionType(LLVM.return_type(ft), new_types)
+    new_ft = LLVM.FunctionType(return_type(ft), new_types)
     new_f = LLVM.Function(mod, "", new_ft)
     linkage!(new_f, linkage(f))
     for (arg, new_arg) in zip(parameters(f), parameters(new_f))
@@ -473,7 +510,7 @@ function lower_byval(@nospecialize(job::CompilerJob), mod::LLVM.Module, f::LLVM.
 
     # emit IR performing the "conversions"
     new_args = LLVM.Value[]
-    @dispose builder=Builder(ctx) begin
+    @dispose builder=IRBuilder(ctx) begin
         entry = BasicBlock(new_f, "conversion"; ctx)
         position!(builder, entry)
 
@@ -546,7 +583,7 @@ function add_kernel_state!(mod::LLVM.Module)
 
     # check if we even need a kernel state argument
     state = kernel_state_type(job)
-    @assert job.source.kernel
+    @assert job.config.kernel
     if state === Nothing
         return false
     end
@@ -555,6 +592,7 @@ function add_kernel_state!(mod::LLVM.Module)
     # intrinsic returning an opaque pointer to the kernel state.
     # this is both for extern uses, and to make this transformation a two-step process.
     state_intr = kernel_state_intr(mod, T_state)
+    state_intr_ft = LLVM.FunctionType(T_state)
 
     kernels = []
     kernels_md = metadata(mod)["julia.kernel"]
@@ -600,12 +638,12 @@ function add_kernel_state!(mod::LLVM.Module)
     workmap = Dict{LLVM.Function, LLVM.Function}()
     for f in worklist
         fn = LLVM.name(f)
-        ft = eltype(llvmtype(f))
+        ft = function_type(f)
         LLVM.name!(f, fn * ".stateless")
 
         # create a new function
         new_param_types = [T_state, parameters(ft)...]
-        new_ft = LLVM.FunctionType(LLVM.return_type(ft), new_param_types)
+        new_ft = LLVM.FunctionType(return_type(ft), new_param_types)
         new_f = LLVM.Function(mod, fn, new_ft)
         LLVM.name!(parameters(new_f)[1], "state")
         linkage!(new_f, linkage(f))
@@ -635,15 +673,15 @@ function add_kernel_state!(mod::LLVM.Module)
                     #
                     # XXX: ptrtoint/inttoptr pairs can also lose the state argument...
                     #      is all this even sound?
-                    typ = llvmtype(val)::LLVM.PointerType
+                    typ = value_type(val)::LLVM.PointerType
                     ft = eltype(typ)::LLVM.FunctionType
-                    new_ft = LLVM.FunctionType(LLVM.return_type(ft), [T_state, parameters(ft)...])
+                    new_ft = LLVM.FunctionType(return_type(ft), [T_state, parameters(ft)...])
                     return const_bitcast(workmap[target], LLVM.PointerType(new_ft, addrspace(typ)))
                 end
             elseif opcode(val) == LLVM.API.LLVMPtrToInt
                 target = operands(val)[1]
                 if target isa LLVM.Function && haskey(workmap, target)
-                    return const_ptrtoint(workmap[target], llvmtype(val))
+                    return const_ptrtoint(workmap[target], value_type(val))
                 end
             end
         end
@@ -684,9 +722,9 @@ function add_kernel_state!(mod::LLVM.Module)
     end
 
     # update uses of the new function, modifying call sites to include the kernel state
-    function rewrite_uses!(f)
+    function rewrite_uses!(f, ft)
         # update uses
-        @dispose builder=Builder(ctx) begin
+        @dispose builder=IRBuilder(ctx) begin
             for use in uses(f)
                 val = user(use)
                 if val isa LLVM.CallBase && called_value(val) == f
@@ -703,9 +741,9 @@ function add_kernel_state!(mod::LLVM.Module)
 
                     # forward the state argument
                     position!(builder, val)
-                    state = call!(builder, state_intr, Value[], "state")
+                    state = call!(builder, state_intr_ft, state_intr, Value[], "state")
                     new_val = if val isa LLVM.CallInst
-                        call!(builder, f, [state, arguments(val)...], operand_bundles(val))
+                        call!(builder, ft, f, [state, arguments(val)...], operand_bundles(val))
                     else
                         # TODO: invoke and callbr
                         error("Rewrite of $(typeof(val))-based calls is not implemented: $val")
@@ -721,7 +759,7 @@ function add_kernel_state!(mod::LLVM.Module)
                 elseif val isa LLVM.StoreInst
                     # the function is being stored, which again we'll permit like before.
                 elseif val isa ConstantExpr
-                    rewrite_uses!(val)
+                    rewrite_uses!(val, ft)
                 else
                     error("Cannot rewrite $(typeof(val)) use of function: $val")
                 end
@@ -729,7 +767,8 @@ function add_kernel_state!(mod::LLVM.Module)
         end
     end
     for f in values(workmap)
-        rewrite_uses!(f)
+        ft = function_type(f)
+        rewrite_uses!(f, ft)
     end
 
     return true
@@ -755,7 +794,7 @@ function lower_kernel_state!(fun::LLVM.Function)
         state_intr = functions(mod)["julia.gpu.state_getter"]
         state_arg = nothing # only look-up when needed
 
-        @dispose builder=Builder(ctx) begin
+        @dispose builder=IRBuilder(ctx) begin
             for use in uses(state_intr)
                 inst = user(use)
                 @assert inst isa LLVM.CallInst
@@ -771,7 +810,7 @@ function lower_kernel_state!(fun::LLVM.Function)
                     # the function, but only when this function needs the state!
                     state_arg = parameters(fun)[1]
                     T_state = convert(LLVMType, state; ctx)
-                    @assert llvmtype(state_arg) == T_state
+                    @assert value_type(state_arg) == T_state
                 end
 
                 replace_uses!(inst, state_arg)
@@ -829,13 +868,14 @@ function kernel_state_value(state)
 
         # get intrinsic
         state_intr = kernel_state_intr(mod, T_state)
+        state_intr_ft = function_type(state_intr)
 
         # generate IR
-        @dispose builder=Builder(ctx) begin
+        @dispose builder=IRBuilder(ctx) begin
             entry = BasicBlock(llvm_f, "entry"; ctx)
             position!(builder, entry)
 
-            val = call!(builder, state_intr, Value[], "state")
+            val = call!(builder, state_intr_ft, state_intr, Value[], "state")
 
             ret!(builder, val)
         end

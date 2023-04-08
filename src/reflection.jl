@@ -49,35 +49,30 @@ include("reflection_compat.jl")
 # code_* replacements
 #
 
-@inline function typed_signature(@nospecialize(job::CompilerJob))
-    u = Base.unwrap_unionall(job.source.tt)
-    return Base.rewrap_unionall(Tuple{job.source.f, u.parameters...}, job.source.tt)
+function code_lowered(@nospecialize(job::CompilerJob); kwargs...)
+    sig = job.source.specTypes  # XXX: can we just use the method instance?
+    code_lowered_by_type(sig; kwargs...)
 end
 
-code_lowered(@nospecialize(job::CompilerJob); kwargs...) =
-    code_lowered_by_type(typed_signature(job); kwargs...)
-
 function code_typed(@nospecialize(job::CompilerJob); interactive::Bool=false, kwargs...)
-    # TODO: use the compiler driver to get the Julia method instance (we might rewrite it)
-    tt = typed_signature(job)
+    sig = job.source.specTypes  # XXX: can we just use the method instance?
     if interactive
         # call Cthulhu without introducing a dependency on Cthulhu
         mod = get(Base.loaded_modules, Cthulhu, nothing)
         mod===nothing && error("Interactive code reflection requires Cthulhu; please install and load this package first.")
         interp = get_interpreter(job)
         descend_code_typed = getfield(mod, :descend_code_typed)
-        descend_code_typed(tt; interp, kwargs...)
+        descend_code_typed(sig; interp, kwargs...)
     elseif VERSION >= v"1.7-"
         interp = get_interpreter(job)
-        Base.code_typed_by_type(tt; interp, kwargs...)
+        Base.code_typed_by_type(sig; interp, kwargs...)
     else
-        Base.code_typed_by_type(tt; kwargs...)
+        Base.code_typed_by_type(sig; kwargs...)
     end
 end
 
 function code_warntype(io::IO, @nospecialize(job::CompilerJob); interactive::Bool=false, kwargs...)
-    # TODO: use the compiler driver to get the Julia method instance (we might rewrite it)
-    tt = typed_signature(job)
+    sig = job.source.specTypes  # XXX: can we just use the method instance?
     if interactive
         @assert io == stdout
         # call Cthulhu without introducing a dependency on Cthulhu
@@ -85,12 +80,12 @@ function code_warntype(io::IO, @nospecialize(job::CompilerJob); interactive::Boo
         mod===nothing && error("Interactive code reflection requires Cthulhu; please install and load this package first.")
         interp = get_interpreter(job)
         descend_code_warntype = getfield(mod, :descend_code_warntype)
-        descend_code_warntype(tt; interp, kwargs...)
+        descend_code_warntype(sig; interp, kwargs...)
     elseif VERSION >= v"1.7-"
         interp = get_interpreter(job)
-        code_warntype_by_type(io, tt; interp, kwargs...)
+        code_warntype_by_type(io, sig; interp, kwargs...)
     else
-        code_warntype_by_type(io, tt; kwargs...)
+        code_warntype_by_type(io, sig; kwargs...)
     end
 end
 code_warntype(@nospecialize(job::CompilerJob); kwargs...) = code_warntype(stdout, job; kwargs...)
@@ -127,7 +122,7 @@ function code_llvm(io::IO, @nospecialize(job::CompilerJob); optimize::Bool=true,
                    debuginfo::Symbol=:default, dump_module::Bool=false, kwargs...)
     # NOTE: jl_dump_function_ir supports stripping metadata, so don't do it in the driver
     str = JuliaContext() do ctx
-        ir, meta = codegen(:llvm, job; optimize=optimize, strip=false, validate=false, ctx, kwargs...)
+        ir, meta = compile(:llvm, job; optimize=optimize, strip=false, validate=false, ctx, kwargs...)
         @static if VERSION >= v"1.9.0-DEV.516"
             ts_mod = ThreadSafeModule(ir; ctx)
             if VERSION >= v"1.9.0-DEV.672"
@@ -174,8 +169,8 @@ The following keyword arguments are supported:
 See also: [`@device_code_native`](@ref), `InteractiveUtils.code_llvm`
 """
 function code_native(io::IO, @nospecialize(job::CompilerJob); raw::Bool=false, dump_module::Bool=false)
-    asm, meta = codegen(:asm, job; strip=!raw, only_entry=!dump_module, validate=false)
-    highlight(io, asm, source_code(job.target))
+    asm, meta = compile(:asm, job; strip=!raw, only_entry=!dump_module, validate=false)
+    highlight(io, asm, source_code(job.config.target))
 end
 code_native(@nospecialize(job::CompilerJob); kwargs...) =
     code_native(stdout, job; kwargs...)
@@ -189,17 +184,23 @@ function emit_hooked_compilation(inner_hook, ex...)
     user_code = ex[end]
     user_kwargs = ex[1:end-1]
     quote
-        local kernels = Set()
+        # we only want to invoke the hook once for every compilation job
+        jobs = Set()
         function outer_hook(job)
-            if !in(job, kernels)
-                $inner_hook(job; $(map(esc, user_kwargs)...))
-                push!(kernels, job)
+            if !in(job, jobs)
+                # the user hook might invoke the compiler again, so disable the hook
+                old_hook = $compile_hook[]
+                try
+                    $compile_hook[] = nothing
+                    $inner_hook(job; $(map(esc, user_kwargs)...))
+                finally
+                    $compile_hook[] = old_hook
+                end
+                push!(jobs, job)
             end
         end
 
-        if $compile_hook[] !== nothing
-            error("Chaining multiple @device_code calls is unsupported")
-        end
+        # now invoke the user code with this hook in place
         try
             $compile_hook[] = outer_hook
             $(esc(user_code))
@@ -207,7 +208,7 @@ function emit_hooked_compilation(inner_hook, ex...)
             $compile_hook[] = nothing
         end
 
-        if isempty(kernels)
+        if isempty(jobs)
             error("no kernels executed while evaluating the given expression")
         end
 
@@ -312,7 +313,7 @@ Evaluates the expression `ex` and dumps all intermediate forms of code to the di
 macro device_code(ex...)
     localUnique = 1
     function hook(job::CompilerJob; dir::AbstractString)
-        name = something(job.source.name, nameof(job.source.f))
+        name = job.source.def.name
         fn = "$(name)_$(localUnique)"
         mkpath(dir)
 

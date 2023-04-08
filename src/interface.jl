@@ -55,62 +55,79 @@ export AbstractCompilerParams
 abstract type AbstractCompilerParams end
 
 
-## function specification
+## config
 
-export FunctionSpec
+export CompilerConfig
 
-# what we'll be compiling
+# the configuration of the compiler
 
-struct FunctionSpec{F,TT}
-    f::Type{F}
-    tt::Type{TT}
+"""
+    CompilerConfig(target, params; kernel=true, entry_abi=:specfunc, name=nothing,
+                                   always_inline=false)
+
+Construct a `CompilerConfig` that will be used to drive compilation for the given `target`
+and `params`.
+
+Several keyword arguments can be used to customize the compilation process:
+
+- `kernel`: specifies if the function should be compiled as a kernel, or as a regular
+   function. This is used to determine the calling convention and for validation purposes.
+- `entry_abi`: can be either `:specfunc` the default, or `:func`. `:specfunc` expects the
+  arguments to be passed in registers, simple return values are returned in registers as
+   well, and complex return values are returned on the stack using `sret`, the calling
+   convention is `fastcc`. The `:func` abi is simpler with a calling convention of the first
+   argument being the function itself (to support closures), the second argument being a
+   pointer to a vector of boxed Julia values and the third argument being the number of
+   values, the return value will also be boxed. The `:func` abi will internally call the
+   `:specfunc` abi, but is generally easier to invoke directly.
+- `name`: the name that will be used for the entrypoint function. If `nothing` (the
+   default), the name will be generated automatically.
+- `always_inline` specifies if the Julia front-end should inline all functions into one if
+   possible.
+"""
+struct CompilerConfig{T,P}
+    target::T
+    params::P
+
     kernel::Bool
     name::Union{Nothing,String}
-    world_age::UInt
-end
+    entry_abi::Symbol
+    always_inline::Bool
 
-
-function Base.hash(spec::FunctionSpec, h::UInt)
-    h = hash(spec.f, h)
-    h = hash(spec.tt, h)
-    h = hash(spec.kernel, h)
-    h = hash(spec.name, h)
-    h = hash(spec.world_age, h)
-    h
-end
-
-# put the function and argument types in typevars
-# so that we can access it from generated functions
-# XXX: the default value of 0xffffffffffffffff is a hack, because we don't properly perform
-#      world age intersection when querying the compilation cache. once we do, callers
-#      should probably provide the world age of the calling code (!= the current world age)
-#      so that querying the cache from, e.g. `cufuncton` is a fully static operation.
-FunctionSpec(f::Type, tt=Tuple{}, kernel=true, name=nothing, world_age=-1%UInt) =
-    FunctionSpec{f,tt}(f, tt, kernel, name, world_age)
-
-FunctionSpec(f, tt=Tuple{}, kernel=true, name=nothing, world_age=-1%UInt) =
-    FunctionSpec(Core.Typeof(f), tt, kernel, name, world_age)
-
-function Base.getproperty(@nospecialize(spec::FunctionSpec), sym::Symbol)
-    if sym == :world
-        # NOTE: this isn't used by the call to `hash` in `check_cache`,
-        #       so we still use the raw world age there.
-        age = spec.world_age
-        return age == -1%UInt ? Base.get_world_counter() : age
-    else
-        return getfield(spec, sym)
+    function CompilerConfig(target::AbstractCompilerTarget,
+                            params::AbstractCompilerParams;
+                            kernel=true,
+                            name=nothing,
+                            entry_abi=:specfunc,
+                            always_inline=false)
+        if entry_abi ∉ (:specfunc, :func)
+            error("Unknown entry_abi=$entry_abi")
+        end
+        new{typeof(target), typeof(params)}(target, params, kernel, name, entry_abi,
+                                            always_inline)
     end
 end
 
-function signature(@nospecialize(spec::FunctionSpec))
-    fn = something(spec.name, nameof(spec.f))
-    args = join(spec.tt.parameters, ", ")
-    return "$fn($(join(spec.tt.parameters, ", ")))"
+# copy constructor
+CompilerConfig(cfg::CompilerConfig; target=cfg.target, params=cfg.params,
+               kernel=cfg.kernel, name=cfg.name, entry_abi=cfg.entry_abi,
+               always_inline=cfg.always_inline) =
+    CompilerConfig(target, params; kernel, entry_abi, name, always_inline)
+
+function Base.show(io::IO, @nospecialize(cfg::CompilerConfig{T})) where {T}
+    print(io, "CompilerConfig for ", T)
 end
 
-function Base.show(io::IO, @nospecialize(spec::FunctionSpec))
-    spec.kernel ? print(io, "kernel ") : print(io, "function ")
-    print(io, signature(spec))
+function Base.hash(cfg::CompilerConfig, h::UInt)
+    h = hash(cfg.target, h)
+    h = hash(cfg.params, h)
+
+    h = hash(cfg.kernel, h)
+    h = hash(cfg.name, h)
+    h = hash(cfg.entry_abi, h)
+    h = hash(cfg.always_inline, h)
+
+    return h
 end
 
 
@@ -118,52 +135,18 @@ end
 
 export CompilerJob
 
+using Core: MethodInstance
+
 # a specific invocation of the compiler, bundling everything needed to generate code
 
-"""
-    CompilerJob(target, source, params, entry_abi)
+struct CompilerJob{T,P}
+    source::MethodInstance
+    config::CompilerConfig{T,P}
+    world::UInt
 
-Construct a `CompilerJob` for `source` that will be used to drive compilation for
-the given `target` and `params`. The `entry_abi` can be either `:specfunc` the default,
-or `:func`. `:specfunc` expects the arguments to be passed in registers, simple
-return values are returned in registers as well, and complex return values are returned
-on the stack using `sret`, the calling convention is `fastcc`. The `:func` abi is simpler
-with a calling convention of the first argument being the function itself (to support closures),
-the second argument being a pointer to a vector of boxed Julia values and the third argument
-being the number of values, the return value will also be boxed. The `:func` abi
-will internally call the `:specfunc` abi, but is generally easier to invoke directly.
-`always_inline` specifies if the Julia front-end should inline all functions into one if possible.
-"""
-struct CompilerJob{T,P,F}
-    target::T
-    source::F
-    params::P
-    entry_abi::Symbol
-    always_inline::Bool
-
-    function CompilerJob(target::AbstractCompilerTarget, source::FunctionSpec, params::AbstractCompilerParams, entry_abi::Symbol, always_inline=true)
-        if entry_abi ∉ (:specfunc, :func)
-            error("Unknown entry_abi=$entry_abi")
-        end
-        new{typeof(target), typeof(params), typeof(source)}(target, source, params, entry_abi, always_inline)
-    end
-end
-CompilerJob(target::AbstractCompilerTarget, source::FunctionSpec, params::AbstractCompilerParams; entry_abi=:specfunc, always_inline=false) =
-    CompilerJob(target, source, params, entry_abi, always_inline)
-
-Base.similar(@nospecialize(job::CompilerJob), @nospecialize(source::FunctionSpec)) =
-    CompilerJob(job.target, source, job.params, job.entry_abi, job.always_inline)
-
-function Base.show(io::IO, @nospecialize(job::CompilerJob{T})) where {T}
-    print(io, "CompilerJob of ", job.source, " for ", T)
-end
-
-function Base.hash(job::CompilerJob, h::UInt)
-    h = hash(job.target, h)
-    h = hash(job.source, h)
-    h = hash(job.params, h)
-    h = hash(job.entry_abi, h)
-    h
+    CompilerJob(src::MethodInstance, cfg::CompilerConfig{T,P},
+                world=tls_world_age()) where {T,P} =
+        new{T,P}(src, cfg, world)
 end
 
 
@@ -194,7 +177,8 @@ isintrinsic(@nospecialize(job::CompilerJob), fn::String) = false
 
 # provide a specific interpreter to use.
 get_interpreter(@nospecialize(job::CompilerJob)) =
-    GPUInterpreter(ci_cache(job), method_table(job), job.source.world, inference_params(job), optimization_params(job))
+    GPUInterpreter(ci_cache(job), method_table(job), job.world,
+                   inference_params(job), optimization_params(job))
 
 # does this target support throwing Julia exceptions with jl_throw?
 # if not, calls to throw will be replaced with calls to the GPU runtime
@@ -227,10 +211,10 @@ function process_entry!(@nospecialize(job::CompilerJob), mod::LLVM.Module,
                         entry::LLVM.Function)
     ctx = context(mod)
 
-    if job.source.kernel && needs_byval(job)
+    if job.config.kernel && needs_byval(job)
         # pass all bitstypes by value; by default Julia passes aggregates by reference
         # (this improves performance, and is mandated by certain back-ends like SPIR-V).
-        args = classify_arguments(job, eltype(llvmtype(entry)))
+        args = classify_arguments(job, function_type(entry))
         for arg in args
             if arg.cc == BITS_REF
                 attr = if LLVM.version() >= v"12"
@@ -273,7 +257,7 @@ valid_function_pointer(@nospecialize(job::CompilerJob), ptr::Ptr{Cvoid}) = false
 # the codeinfo cache to use
 function ci_cache(@nospecialize(job::CompilerJob))
     lock(GLOBAL_CI_CACHES_LOCK) do
-        cache = get!(GLOBAL_CI_CACHES, (typeof(job.target), inference_params(job), optimization_params(job))) do
+        cache = get!(GLOBAL_CI_CACHES, (typeof(job.config.target), inference_params(job), optimization_params(job))) do
             CodeCache()
         end
         return cache
@@ -296,7 +280,7 @@ function optimization_params(@nospecialize(job::CompilerJob))
         kwargs = (kwargs..., unoptimize_throw_blocks=false)
     end
 
-    if job.always_inline
+    if job.config.always_inline
         kwargs = (kwargs..., inline_cost_threshold=typemax(Int))
     end
 

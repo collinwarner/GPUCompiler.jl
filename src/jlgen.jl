@@ -1,13 +1,278 @@
 # Julia compiler integration
 
-## cache
+
+## world age lookups
+
+# `tls_world_age` should be used to look up the current world age. in most cases, this is
+# what you should use to invoke the compiler with.
+#
+# `codegen_world_age` is a special function that returns the world age in which the passed
+# method instance (identified by its function and argument types) is to be compiled. the
+# returned constant is automatically invalidated when the method is redefined, and as such
+# can be used to drive cached compilation. it is unlikely that you should use this function
+# directly, instead use `cached_compilation` which handles invalidation for you.
+
+tls_world_age() = ccall(:jl_get_tls_world_age, UInt, ())
+
+if VERSION >= v"1.10.0-DEV.873"
+
+# on 1.10 (JuliaLang/julia#48611) the generated function knows which world it was invoked in
+
+function _generated_ex(world, source, ex)
+    stub = Core.GeneratedFunctionStub(identity, Core.svec(:methodinstance, :ft, :tt), Core.svec())
+    stub(world, source, ex)
+end
+
+function codegen_world_age_generator(world::UInt, source, self, ft::Type, tt::Type)
+    @nospecialize
+    @assert Core.Compiler.isType(ft) && Core.Compiler.isType(tt)
+    ft = ft.parameters[1]
+    tt = tt.parameters[1]
+
+    # validation
+    ft <: Core.Builtin && error("$(unsafe_function_from_type(ft)) is not a generic function")
+
+    # look up the method
+    method_error = :(throw(MethodError(ft, tt, $world)))
+    sig = Tuple{ft, tt.parameters...}
+    min_world = Ref{UInt}(typemin(UInt))
+    max_world = Ref{UInt}(typemax(UInt))
+    has_ambig = Ptr{Int32}(C_NULL)  # don't care about ambiguous results
+    mthds = if VERSION >= v"1.7.0-DEV.1297"
+        Base._methods_by_ftype(sig, #=mt=# nothing, #=lim=# -1,
+                               world, #=ambig=# false,
+                               min_world, max_world, has_ambig)
+        # XXX: use the correct method table to support overlaying kernels
+    else
+        Base._methods_by_ftype(sig, #=lim=# -1,
+                               world, #=ambig=# false,
+                               min_world, max_world, has_ambig)
+    end
+    mthds === nothing && return _generated_ex(world, source, method_error)
+    length(mthds) == 1 || return _generated_ex(world, source, method_error)
+
+    # look up the method and code instance
+    mtypes, msp, m = mthds[1]
+    mi = ccall(:jl_specializations_get_linfo, Ref{MethodInstance}, (Any, Any, Any), m, mtypes, msp)
+    ci = retrieve_code_info(mi, world)::CodeInfo
+
+    # prepare a new code info
+    new_ci = copy(ci)
+    empty!(new_ci.code)
+    empty!(new_ci.codelocs)
+    resize!(new_ci.linetable, 1)                # see note below
+    empty!(new_ci.ssaflags)
+    new_ci.ssavaluetypes = 0
+    new_ci.min_world = min_world[]
+    new_ci.max_world = max_world[]
+    new_ci.edges = MethodInstance[mi]
+    # XXX: setting this edge does not give us proper method invalidation, see
+    #      JuliaLang/julia#34962 which demonstrates we also need to "call" the kernel.
+    #      invoking `code_llvm` also does the necessary codegen, as does calling the
+    #      underlying C methods -- which GPUCompiler does, so everything Just Works.
+
+    # prepare the slots
+    new_ci.slotnames = Symbol[Symbol("#self#"), :ft, :tt]
+    new_ci.slotflags = UInt8[0x00 for i = 1:3]
+
+    # return the codegen world age
+    push!(new_ci.code, ReturnNode(world))
+    push!(new_ci.ssaflags, 0x00)   # Julia's native compilation pipeline (and its verifier) expects `ssaflags` to be the same length as `code`
+    push!(new_ci.codelocs, 1)   # see note below
+    new_ci.ssavaluetypes += 1
+
+    # NOTE: we keep the first entry of the original linetable, and use it for location info
+    #       on the call to check_cache. we can't not have a codeloc (using 0 causes
+    #       corruption of the back trace), and reusing the target function's info
+    #       has as advantage that we see the name of the kernel in the backtraces.
+
+    return new_ci
+end
+
+@eval function codegen_world_age(ft, tt)
+    $(Expr(:meta, :generated_only))
+    $(Expr(:meta, :generated, codegen_world_age_generator))
+end
+
+else
+
+# on older versions of Julia we fall back to looking up the current world. this may be wrong
+# when the generator is invoked in a different world (TODO: when does this happen?)
+
+function codegen_world_age_generator(self, ft::Type, tt::Type)
+    @nospecialize
+    @assert Core.Compiler.isType(ft) && Core.Compiler.isType(tt)
+    ft = ft.parameters[1]
+    tt = tt.parameters[1]
+
+    # validation
+    ft <: Core.Builtin && error("$(unsafe_function_from_type(ft)) is not a generic function")
+
+    # look up the method
+    method_error = :(throw(MethodError(ft, tt)))
+    sig = Tuple{ft, tt.parameters...}
+    min_world = Ref{UInt}(typemin(UInt))
+    max_world = Ref{UInt}(typemax(UInt))
+    has_ambig = Ptr{Int32}(C_NULL)  # don't care about ambiguous results
+    mthds = if VERSION >= v"1.7.0-DEV.1297"
+        Base._methods_by_ftype(sig, #=mt=# nothing, #=lim=# -1,
+                               #=world=# typemax(UInt), #=ambig=# false,
+                               min_world, max_world, has_ambig)
+        # XXX: use the correct method table to support overlaying kernels
+    else
+        Base._methods_by_ftype(sig, #=lim=# -1,
+                               #=world=# typemax(UInt), #=ambig=# false,
+                               min_world, max_world, has_ambig)
+    end
+    # XXX: using world=-1 is wrong, but the current world isn't exposed to this generator
+    mthds === nothing && return method_error
+    length(mthds) == 1 || return method_error
+
+    # look up the method and code instance
+    mtypes, msp, m = mthds[1]
+    mi = ccall(:jl_specializations_get_linfo, Ref{MethodInstance}, (Any, Any, Any), m, mtypes, msp)
+    ci = retrieve_code_info(mi)::CodeInfo
+
+    # prepare a new code info
+    new_ci = copy(ci)
+    empty!(new_ci.code)
+    empty!(new_ci.codelocs)
+    resize!(new_ci.linetable, 1)                # see note below
+    empty!(new_ci.ssaflags)
+    new_ci.ssavaluetypes = 0
+    new_ci.min_world = min_world[]
+    new_ci.max_world = max_world[]
+    new_ci.edges = MethodInstance[mi]
+    # XXX: setting this edge does not give us proper method invalidation, see
+    #      JuliaLang/julia#34962 which demonstrates we also need to "call" the kernel.
+    #      invoking `code_llvm` also does the necessary codegen, as does calling the
+    #      underlying C methods -- which GPUCompiler does, so everything Just Works.
+
+    # prepare the slots
+    new_ci.slotnames = Symbol[Symbol("#self#"), :ft, :tt]
+    new_ci.slotflags = UInt8[0x00 for i = 1:3]
+
+    # return the current world age (which is not technically the codegen world age,
+    # but works well enough for invalidation purposes)
+    push!(new_ci.code, ReturnNode(Base.get_world_counter()))
+    push!(new_ci.ssaflags, 0x00)   # Julia's native compilation pipeline (and its verifier) expects `ssaflags` to be the same length as `code`
+    push!(new_ci.codelocs, 1)   # see note below
+    new_ci.ssavaluetypes += 1
+
+    # NOTE: we keep the first entry of the original linetable, and use it for location info
+    #       on the call to check_cache. we can't not have a codeloc (using 0 causes
+    #       corruption of the back trace), and reusing the target function's info
+    #       has as advantage that we see the name of the kernel in the backtraces.
+
+    return new_ci
+end
+
+@eval function codegen_world_age(ft, tt)
+    $(Expr(:meta, :generated_only))
+    $(Expr(:meta,
+           :generated,
+           Expr(:new,
+                Core.GeneratedFunctionStub,
+                :codegen_world_age_generator,
+                Any[:methodinstance, :ft, :tt],
+                Any[],
+                @__LINE__,
+                QuoteNode(Symbol(@__FILE__)),
+                true)))
+end
+
+end
+
+
+## looking up method instances
+
+export methodinstance
+
+using Core.Compiler: retrieve_code_info, CodeInfo, MethodInstance, SSAValue, SlotNumber, ReturnNode
+using Base: _methods_by_ftype
+
+@inline function typed_signature(ft::Type, tt::Type)
+    u = Base.unwrap_unionall(tt)
+    return Base.rewrap_unionall(Tuple{ft, u.parameters...}, tt)
+end
+
+# create a MethodError from a function type
+# TODO: fix upstream
+function unsafe_function_from_type(ft::Type)
+    if isdefined(ft, :instance)
+        ft.instance
+    else
+        # HACK: dealing with a closure or something... let's do somthing really invalid,
+        #       which works because MethodError doesn't actually use the function
+        Ref{ft}()[]
+    end
+end
+function MethodError(ft::Type, tt::Type, world::Integer=typemax(UInt))
+    Base.MethodError(unsafe_function_from_type(ft), tt, world)
+end
+
+"""
+    methodinstance(ft::Type, tt::Type, [world::UInt])
+
+Look up the method instance that corresponds to invoking the function with type `ft` with
+argument typed `tt`. If the `world` argument is specified, the look-up is static and will
+always return the same result. If the `world` argument is not specified, the look-up is
+dynamic and the returned method instance will automatically be invalidated when a relevant
+function is redefined.
+"""
+function methodinstance(ft::Type, tt::Type, world::Integer=tls_world_age())
+    sig = typed_signature(ft, tt)
+
+    # look-up the method
+    meth = if VERSION >= v"1.10.0-DEV.65"
+        Base._which(sig; world).method
+    elseif VERSION >= v"1.7.0-DEV.435"
+        Base._which(sig, world).method
+    else
+        ccall(:jl_gf_invoke_lookup, Any, (Any, UInt), sig, world)
+    end
+
+    (ti, env) = ccall(:jl_type_intersection_with_env, Any,
+                      (Any, Any), sig, meth.sig)::Core.SimpleVector
+
+    meth = Base.func_for_method_checked(meth, ti, env)
+
+    method_instance = ccall(:jl_specializations_get_linfo, Ref{Core.MethodInstance},
+                            (Any, Any, Any, UInt), meth, ti, env, world)
+
+    return method_instance
+end
+
+Base.@deprecate_binding FunctionSpec methodinstance
+
+
+## code instance cache
 
 using Core.Compiler: CodeInstance, MethodInstance, InferenceParams, OptimizationParams
 
 struct CodeCache
     dict::IdDict{MethodInstance,Vector{CodeInstance}}
 
-    CodeCache() = new(Dict{MethodInstance,Vector{CodeInstance}}())
+    CodeCache() = new(IdDict{MethodInstance,Vector{CodeInstance}}())
+    CodeCache(cache::CodeCache) = new(GPUCompiler.copyAndFilter(cache.dict))
+end
+
+function copyAndFilter(dict::IdDict)
+    out= IdDict()
+    for key in keys(dict)
+        useKey = true
+        # why is it an array of code instances, can there be more than 1?
+        for ci in dict[key]
+            if ci.max_world < typemax(typeof(ci.max_world))
+                useKey = false
+                break
+            end
+        end
+        if useKey
+            out[key] = dict[key]
+        end
+    end
+    return out
 end
 
 function Base.show(io::IO, ::MIME"text/plain", cc::CodeCache)
@@ -345,14 +610,34 @@ function _lookup_fun(mi, min_world, max_world)
     ci_cache_lookup(_cache[], mi, min_world, max_world)
 end
 
-function compile_method_instance(@nospecialize(job::CompilerJob),
-                                 method_instance::MethodInstance; ctx::JuliaContextType)
+@enum CompilationPolicy::Cint begin
+    CompilationPolicyDefault = 0
+    CompilationPolicyExtern = 1
+end
+
+# HACK: in older versions of Julia, `jl_create_native` doesn't take a world argument
+#       but instead always generates code for the current world. note that this doesn't
+#       actually change the world age, but just spoofs the counter `jl_create_native` reads.
+macro in_world(world, ex)
+    quote
+        actual_world = Base.get_world_counter()
+        world_counter = cglobal(:jl_world_counter, Csize_t)
+        unsafe_store!(world_counter, $(esc(world)))
+        try
+            $(esc(ex))
+        finally
+            unsafe_store!(world_counter, actual_world)
+        end
+    end
+end
+
+function compile_method_instance(@nospecialize(job::CompilerJob); ctx::JuliaContextType)
     # populate the cache
     cache = ci_cache(job)
     mt = method_table(job)
     interp = get_interpreter(job)
-    if ci_cache_lookup(cache, method_instance, job.source.world, typemax(Cint)) === nothing
-        ci_cache_populate(interp, cache, mt, method_instance, job.source.world, typemax(Cint))
+    if ci_cache_lookup(cache, job.source, job.world, job.world) === nothing
+        ci_cache_populate(interp, cache, mt, job.source, job.world, job.world)
     end
 
     # create a callback to look-up function in our cache,
@@ -382,7 +667,7 @@ function compile_method_instance(@nospecialize(job::CompilerJob),
     @static if v"1.9.0-DEV.1660" <= VERSION < v"1.9.0-beta1" || VERSION >= v"1.10-"
         cgparams = merge(cgparams, (;safepoint_on_entry = can_safepoint(job)))
     end
-    params = Base.CodegenParams(;cgparams...)
+    params = Base.CodegenParams(; cgparams...)
 
     # generate IR
     GC.@preserve lookup_cb begin
@@ -390,9 +675,9 @@ function compile_method_instance(@nospecialize(job::CompilerJob),
             mod = LLVM.Module("start"; ctx=unwrap_context(ctx))
 
             # configure the module
-            triple!(mod, llvm_triple(job.target))
-            if julia_datalayout(job.target) !== nothing
-                datalayout!(mod, julia_datalayout(job.target))
+            triple!(mod, llvm_triple(job.config.target))
+            if julia_datalayout(job.config.target) !== nothing
+                datalayout!(mod, julia_datalayout(job.config.target))
             end
             flags(mod)["Dwarf Version", LLVM.API.LLVMModuleFlagBehaviorWarning] =
                 Metadata(ConstantInt(Int32(4); ctx=unwrap_context(ctx)))
@@ -400,35 +685,38 @@ function compile_method_instance(@nospecialize(job::CompilerJob),
                 Metadata(ConstantInt(DEBUG_METADATA_VERSION(); ctx=unwrap_context(ctx)))
 
             ts_mod = ThreadSafeModule(mod; ctx)
-            # 1.9.0-alpha1.55 added external_linkage
-            # 1.9.0-alpha1.33 added imaging_mode
-            # 1.9.0-beta4.23 added world
-            if VERSION >= v"1.9.0-beta4.23"
+            if VERSION >= v"1.10.0-DEV.645" || v"1.9.0-beta4.23" <= VERSION < v"1.10-"
                 ccall(:jl_create_native, Ptr{Cvoid},
-                  (Vector{MethodInstance}, LLVM.API.LLVMOrcThreadSafeModuleRef, Ptr{Base.CodegenParams},
-                   Cint, Cint, Cint, Csize_t),
-                  [method_instance], ts_mod, Ref(params),
-                  #=extern policy=# 1, #=imaging mode=# 0,  #=external linkage=# 0,
-                  Base.get_world_counter()) # TODO: Fixme
+                      (Vector{MethodInstance}, LLVM.API.LLVMOrcThreadSafeModuleRef, Ptr{Base.CodegenParams}, Cint, Cint, Cint, Csize_t),
+                      [job.source], ts_mod, Ref(params), CompilationPolicyExtern, #=imaging mode=# 0, #=external linkage=# 0, job.world)
+            elseif VERSION >= v"1.10.0-DEV.204" || v"1.9.0-alpha1.55" <= VERSION < v"1.10-"
+                @in_world job.world ccall(:jl_create_native, Ptr{Cvoid},
+                      (Vector{MethodInstance}, LLVM.API.LLVMOrcThreadSafeModuleRef, Ptr{Base.CodegenParams}, Cint, Cint, Cint),
+                      [job.source], ts_mod, Ref(params), CompilationPolicyExtern, #=imaging mode=# 0, #=external linkage=# 0)
+            elseif VERSION >= v"1.10.0-DEV.75"
+                @in_world job.world ccall(:jl_create_native, Ptr{Cvoid},
+                      (Vector{MethodInstance}, LLVM.API.LLVMOrcThreadSafeModuleRef, Ptr{Base.CodegenParams}, Cint, Cint),
+                      [job.source], ts_mod, Ref(params), CompilationPolicyExtern, #=imaging mode=# 0)
             else
-                ccall(:jl_create_native, Ptr{Cvoid},
-                    (Vector{MethodInstance}, LLVM.API.LLVMOrcThreadSafeModuleRef, Ptr{Base.CodegenParams}, Cint),
-                    [method_instance], ts_mod, Ref(params), #=extern policy=# 1)
+                @in_world job.world ccall(:jl_create_native, Ptr{Cvoid},
+                      (Vector{MethodInstance}, LLVM.API.LLVMOrcThreadSafeModuleRef, Ptr{Base.CodegenParams}, Cint),
+                      [job.source], ts_mod, Ref(params), CompilationPolicyExtern)
+
             end
         elseif VERSION >= v"1.9.0-DEV.115"
-            ccall(:jl_create_native, Ptr{Cvoid},
+            @in_world job.world ccall(:jl_create_native, Ptr{Cvoid},
                   (Vector{MethodInstance}, LLVM.API.LLVMContextRef, Ptr{Base.CodegenParams}, Cint),
-                  [method_instance], ctx, Ref(params), #=extern policy=# 1)
+                  [job.source], ctx, Ref(params), CompilationPolicyExtern)
         elseif VERSION >= v"1.8.0-DEV.661"
             @assert ctx == JuliaContext()
-            ccall(:jl_create_native, Ptr{Cvoid},
+            @in_world job.world ccall(:jl_create_native, Ptr{Cvoid},
                   (Vector{MethodInstance}, Ptr{Base.CodegenParams}, Cint),
-                  [method_instance], Ref(params), #=extern policy=# 1)
+                  [job.source], Ref(params), CompilationPolicyExtern)
         else
             @assert ctx == JuliaContext()
-            ccall(:jl_create_native, Ptr{Cvoid},
+            @in_world job.world ccall(:jl_create_native, Ptr{Cvoid},
                   (Vector{MethodInstance}, Base.CodegenParams, Cint),
-                  [method_instance], params, #=extern policy=# 1)
+                  [job.source], params, CompilationPolicyExtern)
         end
         @assert native_code != C_NULL
         llvm_mod_ref = if VERSION >= v"1.9.0-DEV.516"
@@ -456,47 +744,48 @@ function compile_method_instance(@nospecialize(job::CompilerJob),
     # process all compiled method instances
     compiled = Dict()
     for mi in method_instances
-        ci = ci_cache_lookup(cache, mi, job.source.world, typemax(Cint))
+        ci = ci_cache_lookup(cache, mi, job.world, job.world)
+        ci === nothing && continue
 
-        if ci !== nothing
-            # get the function index
-            llvm_func_idx = Ref{Int32}(-1)
-            llvm_specfunc_idx = Ref{Int32}(-1)
-            ccall(:jl_get_function_id, Nothing,
-                (Ptr{Cvoid}, Any, Ptr{Int32}, Ptr{Int32}),
-                native_code, ci, llvm_func_idx, llvm_specfunc_idx)
+        # get the function index
+        llvm_func_idx = Ref{Int32}(-1)
+        llvm_specfunc_idx = Ref{Int32}(-1)
+        ccall(:jl_get_function_id, Nothing,
+              (Ptr{Cvoid}, Any, Ptr{Int32}, Ptr{Int32}),
+              native_code, ci, llvm_func_idx, llvm_specfunc_idx)
 
-            # get the function
-            llvm_func = if llvm_func_idx[] != -1
-                llvm_func_ref = ccall(:jl_get_llvm_function, LLVM.API.LLVMValueRef,
-                                      (Ptr{Cvoid}, UInt32), native_code, llvm_func_idx[]-1)
-                @assert llvm_func_ref != C_NULL
-                LLVM.name(LLVM.Function(llvm_func_ref))
-            else
-                nothing
-            end
-
-
-            llvm_specfunc = if llvm_specfunc_idx[] != -1
-                llvm_specfunc_ref = ccall(:jl_get_llvm_function, LLVM.API.LLVMValueRef,
-                                        (Ptr{Cvoid}, UInt32), native_code, llvm_specfunc_idx[]-1)
-                @assert llvm_specfunc_ref != C_NULL
-                LLVM.name(LLVM.Function(llvm_specfunc_ref))
-            else
-                nothing
-            end
-
-            # NOTE: it's not safe to store raw LLVM functions here, since those may get
-            #       removed or renamed during optimization, so we store their name instead.
-            compiled[mi] = (; ci, func=llvm_func, specfunc=llvm_specfunc)
+        # get the function
+        llvm_func = if llvm_func_idx[] >=  1
+            llvm_func_ref = ccall(:jl_get_llvm_function, LLVM.API.LLVMValueRef,
+                                  (Ptr{Cvoid}, UInt32), native_code, llvm_func_idx[]-1)
+            @assert llvm_func_ref != C_NULL
+            LLVM.name(LLVM.Function(llvm_func_ref))
+        else
+            nothing
         end
+
+        llvm_specfunc = if llvm_specfunc_idx[] >=  1
+            llvm_specfunc_ref = ccall(:jl_get_llvm_function, LLVM.API.LLVMValueRef,
+                                      (Ptr{Cvoid}, UInt32), native_code, llvm_specfunc_idx[]-1)
+            @assert llvm_specfunc_ref != C_NULL
+            LLVM.name(LLVM.Function(llvm_specfunc_ref))
+        else
+            nothing
+        end
+
+        # NOTE: it's not safe to store raw LLVM functions here, since those may get
+        #       removed or renamed during optimization, so we store their name instead.
+        compiled[mi] = (; ci, func=llvm_func, specfunc=llvm_specfunc)
     end
+
+    # ensure that the requested method instance was compiled
+    @assert haskey(compiled, job.source)
 
     if VERSION < v"1.9.0-DEV.516"
         # configure the module
-        triple!(llvm_mod, llvm_triple(job.target))
-        if julia_datalayout(job.target) !== nothing
-            datalayout!(llvm_mod, julia_datalayout(job.target))
+        triple!(llvm_mod, llvm_triple(job.config.target))
+        if julia_datalayout(job.config.target) !== nothing
+            datalayout!(llvm_mod, julia_datalayout(job.config.target))
         end
     end
 

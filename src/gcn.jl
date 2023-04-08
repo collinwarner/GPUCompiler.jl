@@ -30,7 +30,7 @@ end
 
 # TODO: encode debug build or not in the compiler job
 #       https://github.com/JuliaGPU/CUDAnative.jl/issues/368
-runtime_slug(job::CompilerJob{GCNCompilerTarget}) = "gcn-$(job.target.dev_isa)$(job.target.features)"
+runtime_slug(job::CompilerJob{GCNCompilerTarget}) = "gcn-$(job.config.target.dev_isa)$(job.config.target.features)"
 
 const gcn_intrinsics = () # TODO: ("vprintf", "__assertfail", "malloc", "free")
 isintrinsic(::CompilerJob{GCNCompilerTarget}, fn::String) = in(fn, gcn_intrinsics)
@@ -38,7 +38,7 @@ isintrinsic(::CompilerJob{GCNCompilerTarget}, fn::String) = in(fn, gcn_intrinsic
 function process_entry!(job::CompilerJob{GCNCompilerTarget}, mod::LLVM.Module, entry::LLVM.Function)
     entry = invoke(process_entry!, Tuple{CompilerJob, LLVM.Module, LLVM.Function}, job, mod, entry)
 
-    if job.source.kernel
+    if job.config.kernel
         # calling convention
         callconv!(entry, LLVM.API.LLVMAMDGPUKERNELCallConv)
     end
@@ -54,7 +54,7 @@ function finish_module!(@nospecialize(job::CompilerJob{GCNCompilerTarget}),
                         mod::LLVM.Module, entry::LLVM.Function)
     entry = invoke(finish_module!, Tuple{CompilerJob, LLVM.Module, LLVM.Function}, job, mod, entry)
 
-    if job.source.kernel
+    if job.config.kernel
         # work around bad byval codegen (JuliaGPU/GPUCompiler.jl#92)
         entry = lower_byval(job, mod, entry)
     end
@@ -84,10 +84,10 @@ end
 function optimize_module!(job::CompilerJob{GCNCompilerTarget}, mod::LLVM.Module)
     @static if VERSION < v"1.9.0-DEV.1018"
         # revert back to the AMDGPU target
-        triple!(mod, llvm_triple(job.target))
-        datalayout!(mod, julia_datalayout(job.target))
+        triple!(mod, llvm_triple(job.config.target))
+        datalayout!(mod, julia_datalayout(job.config.target))
 
-        tm = llvm_machine(job.target)
+        tm = llvm_machine(job.config.target)
         @dispose pm=ModulePassManager() begin
             add_library_info!(pm, triple(mod))
             add_transform_info!(pm, tm)
@@ -124,7 +124,7 @@ function lower_throw_extra!(mod::LLVM.Module)
                     call = user(use)::LLVM.CallInst
 
                     # replace the throw with a trap
-                    @dispose builder=Builder(ctx) begin
+                    @dispose builder=IRBuilder(ctx) begin
                         position!(builder, call)
                         emit_exception!(builder, f_name, call)
                     end
@@ -168,12 +168,12 @@ function fix_alloca_addrspace!(fn::LLVM.Function)
     for bb in blocks(fn)
         for insn in instructions(bb)
             if isa(insn, LLVM.AllocaInst)
-                ty = llvmtype(insn)
+                ty = value_type(insn)
                 ety = eltype(ty)
                 addrspace(ty) == alloca_as && continue
 
                 new_insn = nothing
-                @dispose builder=Builder(ctx) begin
+                @dispose builder=IRBuilder(ctx) begin
                     position!(builder, insn)
                     _alloca = alloca!(builder, ety, name(insn))
                     new_insn = addrspacecast!(builder, _alloca, ty)
@@ -189,10 +189,11 @@ end
 
 function emit_trap!(job::CompilerJob{GCNCompilerTarget}, builder, mod, inst)
     ctx = context(mod)
+    trap_ft = LLVM.FunctionType(LLVM.VoidType(ctx))
     trap = if haskey(functions(mod), "llvm.trap")
         functions(mod)["llvm.trap"]
     else
-        LLVM.Function(mod, "llvm.trap", LLVM.FunctionType(LLVM.VoidType(ctx)))
+        LLVM.Function(mod, "llvm.trap", trap_ft)
     end
     if Base.libllvm_version < v"9"
         rl_ft = LLVM.FunctionType(LLVM.Int32Type(ctx),
@@ -209,9 +210,9 @@ function emit_trap!(job::CompilerJob{GCNCompilerTarget}, builder, mod, inst)
         # this, the target will only attempt to do a "masked branch", which
         # only works on vector instructions (trap is a scalar instruction, and
         # therefore it is executed even when EXEC==0).
-        rl_val = call!(builder, rl, [ConstantInt(Int32(32); ctx)])
+        rl_val = call!(builder, rl_ft, rl, [ConstantInt(Int32(32); ctx)])
         rl_bc = inttoptr!(builder, rl_val, LLVM.PointerType(LLVM.Int32Type(ctx)))
         store!(builder, rl_val, rl_bc)
     end
-    call!(builder, trap)
+    call!(builder, trap_ft, trap)
 end
