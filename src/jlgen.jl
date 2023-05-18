@@ -152,16 +152,19 @@ end
 
 struct CodeCache
     dict::IdDict{MethodInstance,Vector{CodeInstance}}
+    asm::IdDict{MethodInstance, NamedTuple{(:image, :entry, :external_gvars), Tuple{Vector{UInt8}, String, Vector{String}}}}
 
-    CodeCache() = new(Dict{MethodInstance,Vector{CodeInstance}}())
-    CodeCache(cache::CodeCache) = new(GPUCompiler.copyAndFilter(cache.dict))
+    CodeCache() = new(Dict{MethodInstance,Vector{CodeInstance}}(), 
+    Dict{MethodInstance, NamedTuple{(:image, :entry, :external_gvars), Tuple{Vector{UInt8}, String, Vector{String}}}}())
+
+    CodeCache(cache::CodeCache) = new(GPUCompiler.copyAndFilter(cache.dict), cache.asm)
 end
 
 function copyAndFilter(dict::IdDict)
     out= IdDict()
     for key in keys(dict)
         useKey = true
-        # why is it an array of code instances, can there be more than 1?
+
         for ci in dict[key]
             if ci.max_world < typemax(typeof(ci.max_world))
                 useKey = false
@@ -522,7 +525,6 @@ function ci_cache_lookup(cache, mi, min_world, max_world)
     end
     return ci
 end
-
 
 ## interface
 
